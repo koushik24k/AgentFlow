@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "python-dotenv>=1.0",
-    "pydantic>=2.8"
+    "pydantic>=2.8",
+    "PyYAML>=6.0",
+    "Flask>=3.0"
 ]
 
 [project.optional-dependencies]
@@ -27,3 +29,6 @@ testpaths = ["tests"]
 filterwarnings = [
     "ignore::DeprecationWarning"
 ]
+
+[project.scripts]
+agentflow = "agentflow.cli:main"

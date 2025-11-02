@@ -9,11 +9,13 @@ AgentFlow - Plan/Execute Visualizer PRD
 2. Goals and Non-Goals
 ----------------------
 - **Goals**
-  - Generate machine-editable YAML plans before execution with explicit graph structure.
-  - Execute plans node by node, updating the YAML with timestamps, outputs, and status transitions.
-  - Provide a Flask-based web UI that renders the plan graph, node timeline, and node detail panels.
-  - Offer an API contract so external runners can read and write plan YAML safely (locking, diffing).
-  - Support human-in-the-loop overrides such as pause, edit, rerun, and manual annotations.
+- Generate machine-editable YAML plans before execution with explicit graph structure.
+- Execute plans node by node, updating the YAML with timestamps, outputs, and status transitions.
+- Provide a Flask-based web UI that renders the plan graph, node timeline, and node detail panels.
+- Offer an API contract so external runners can read and write plan YAML safely (locking, diffing).
+- Support human-in-the-loop overrides such as pause, edit, rerun, and manual annotations.
+- Ship a lightweight `agentflow` CLI that can draft executions from natural language prompts.
+- Expose a `view` mode in the CLI that launches the local visualization server focused on AgentFlow artifacts.
 - **Non-Goals**
   - Building a full agent marketplace or workflow marketplace.
   - Implementing complex role-based access control; assume a single trusted operator in v1.
@@ -70,7 +72,25 @@ AgentFlow - Plan/Execute Visualizer PRD
 6. On failure, runner marks node `failed`, optionally marks downstream nodes `blocked`, and emits alerts.
 7. Runner sets plan status to `completed` when all nodes succeed or `failed` when any critical node fails without retry.
 
-### 6.3 Human Oversight
+### 6.3 CLI Tooling
+- `agentflow "<prompt text>"`:
+  - Loads `Settings` (Codex CLI path, model, sandbox, approval policy).
+  - Invokes the Codex CLI adapter with the supplied prompt.
+  - Emits a YAML artifact in the working directory named `agentflow-YYYYMMDDHHMMSS.yaml`.
+  - Populates mandatory metadata (`schema_version`, `plan_id`, `name`, `description`, `created_at`, `created_by`, `status`).
+  - Creates a single node (`id: codex_execution`) storing prompt inputs, Codex response, usage metrics, adapter events, timestamps, and attempt history.
+  - Marks the plan `completed` on success. On failure, the CLI still writes a YAML file with `status: failed` and captured stderr in `nodes[0].error`.
+- Artifacts adopt the plan schema described in §6.1 to maintain compatibility with downstream tooling.
+
+- `agentflow view [--host 127.0.0.1] [--port 5050] [--directory .]`:
+  - Boots a Flask server serving static assets and JSON endpoints sourced from the specified directory.
+  - Only indexes YAML files that match `agentflow-*.yaml` and contain the expected schema version.
+  - `GET /plans` lists discovered plans with metadata (id, name, status, timestamps).
+  - `GET /plans/<plan_id>` returns the full plan payload for visualization.
+  - Default HTML template renders a lightweight DAG (placeholder acceptable in v1) and node detail panes.
+  - Server operates read-only and shuts down via `Ctrl+C`; future authentication and streaming are out of scope for MVP.
+
+### 6.4 Human Oversight
 - Manual overrides can edit node inputs or mark statuses; runner detects `manual_override` flags and revalidates.
 - Pause and resume: plan status `paused` prevents new node execution until restored to `running`.
 - Notes: plan-level `notes` and node-level `notes` support markdown comments for audit context.
@@ -96,9 +116,8 @@ AgentFlow - Plan/Execute Visualizer PRD
 8. Interfaces and Integrations
 ------------------------------
 - **CLI Commands**
-  - `agentflow plan create --spec spec.md` produces validated YAML.
-  - `agentflow run plan.yml` orchestrates execution and writes updates.
-  - `agentflow node rerun plan.yml --node <id>` reruns a single node.
+  - `agentflow "<prompt>"` generates and executes a single-step plan via Codex, persisting results as YAML.
+  - `agentflow view [--host] [--port] [--directory]` launches the local viewer for generated artifacts.
 - **File Contract**
   - YAML encoded in UTF-8 with two-space indentation.
   - Runner maintains trailing comment or metadata hash describing last update.

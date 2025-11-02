@@ -41,3 +41,9 @@ Set `OPENAI_API_KEY` in `.env` (already provided). Tests automatically load it.
 
 - `pytest -k unit` runs fast unit tests.
 - `pytest tests/live -m live` runs the live Codex integration test (uses real API calls).
+
+## Using the CLI
+
+- `agentflow "Draft a project summary"` invokes the Codex adapter, stores the response in `agentflow-<timestamp>.yaml`, and prints the artifact path.
+- `agentflow view --host 0.0.0.0 --port 5050` launches the Flask viewer for any AgentFlow YAML files in the current directory.
+- Generated YAML adheres to the plan schema from the PRD and includes metadata, timeline, usage metrics, and adapter events for auditability.
