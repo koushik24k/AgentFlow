@@ -1,11 +1,24 @@
 # AgentFlow
 
-Prototype scaffolding for the AgentFlow planner and Codex CLI adapter described in the PRD.
+> Prototype scaffolding for the AgentFlow planner and Codex CLI adapter described in the PRD.
+
+## Problem We Are Solving
+
+Modern agent workflows span many steps, tools, and retries, yet most planners treat execution as a black box. Operators cannot see a persistent plan, reason about dependencies, or audit decisions after the fact. Teams end up stitching together logs, spreadsheets, and ad-hoc dashboards just to answer basic questions like “what ran?” or “why did the agent choose that tool?”
+
+## Why This Direction
+
+AgentFlow fixes that visibility gap by standardizing on a canonical YAML plan that survives from planning through execution. A Codex-style CLI orchestrator executes the plan node by node, writing structured state and metrics back into the same file, while a lightweight Flask UI renders the plan as an interactive graph. This direction gives engineers:
+
+- A machine-editable plan they can diff, review, and version in git.
+- Deterministic execution with human-in-the-loop controls (pause, edit, rerun).
+- A shared contract so external runners or evaluators can plug in without reimplementing the stack.
+- Real-time observability over progress, failures, and evaluation metrics captured per node.
 
 ## Layout
 
-- `src/agentflow/` – core package with configuration helpers and adapters.
-- `tests/` – unit and live tests for the Codex adapter.
+- `src/agentflow/` - core package with configuration helpers and adapters.
+- `tests/` - unit and live tests for the Codex adapter.
 
 ## Getting Started
 

@@ -115,13 +115,63 @@ AgentFlow - Plan/Execute Visualizer PRD
 - **Extensibility**: Schema versioning via `schema_version` and documented migration steps.
 - **Testing**: Unit tests for schema validation and integration tests for sample plans.
 
-10. Success Metrics and Milestones
+10. Evaluation Framework
+------------------------
+- Establish a first-class eval mode so teams can measure plan, agent, and tool quality without leaving AgentFlow.
+- Eval runs use the same YAML schema as production plans and write metrics back into node `metrics` fields plus a plan-level `eval_metrics` rollup file.
+- CLI exposes `agentflow eval run <eval.yml>` to execute eval suites and emits JSONL artifacts for downstream dashboards (e.g., compare runs over time).
+
+### 10.1 Scope and Trigger
+- Eval plans live alongside production flows and are tagged with `plan_type: eval` to activate eval-only behaviors.
+- Runner accepts a `--eval-run` flag that:
+  - disables destructive tool invocations by default unless `allow_live_tools` is set on a node.
+  - enforces deterministic seeds for agent backends when supported.
+  - captures intermediate thoughts, tool traces, and reference answers required for scoring.
+- Eval executions must be reproducible; the runner caches prompts, tool IO, and responses so failures can be replayed offline.
+
+### 10.2 Instrumentation Requirements
+- Each node adapter records raw inputs, outputs, references (gold answers), and scorer metadata in `metrics.inputs`, `metrics.outputs`, and `metrics.references`.
+- Eval runners optionally call dedicated scorers (Python hooks or HTTP services) to compute metrics per node and per plan.
+- Failures to compute metrics never block the run; they are captured under `metrics.errors` with a retry path.
+- Final plan artifact includes:
+  - `plan.yaml` (with metric annotations),
+  - `plan.metrics.json` (plan-level aggregates),
+  - `trace.jsonl` (step-by-step logs for offline analysis).
+
+### 10.3 Metric Taxonomy
+| Metric Category      | Key Metrics                                                                 |
+|----------------------|------------------------------------------------------------------------------|
+| Task Completion      | Success Rate: (Binary) Did it complete the task? (e.g., pass@1)             |
+|                      | Intent Resolution: Did it fulfill the true intent of the user's request?     |
+| Reasoning & Planning | Step Validity: Was each "thought" or reasoning step logical?                 |
+|                      | Plan Quality: How coherent and effective was the agent's overall plan?       |
+| Tool Use Fidelity    | Tool Selection Accuracy: Did it pick the right tool from its available set? |
+|                      | Parameter Accuracy: Did it format the API call/function arguments correctly? |
+| Efficiency & Cost    | Latency: Total time from prompt to final answer.                             |
+|                      | Token Usage / Cost: Total tokens (prompt + completion) used.                 |
+|                      | Step Count: Number of reasoning/action steps (fewer is often better).        |
+| Robustness & Safety  | Error Handling: How well does it recover from unexpected errors?             |
+|                      | Adversarial Robustness: Does it fail when given tricky or misleading prompts?|
+|                      | Policy Adherence: Did it refuse tasks that violate safety guidelines?        |
+
+### 10.4 Reporting and UX
+- Web UI adds an Eval Dashboard tab that surfaces plan-level aggregates, per-metric trendlines, and filters by dataset version.
+- CLI prints a concise eval summary table after each run and stores results under `.agentflow/evals/<plan_id>/<run_id>/`.
+- GitHub Actions template runs eval suites nightly and comments on regressions (thresholds configurable per metric).
+
+### 10.5 Implementation Phases
+1. Instrument runner to capture required artifacts and write metric files.
+2. Introduce scorer interface and ship reference scorers for success rate, intent resolution, and tool fidelity.
+3. Extend UI/CLI surfaces for eval dashboards and historical comparisons.
+4. Add regression gating: release pipelines fail when critical metrics drop below agreed thresholds.
+
+11. Success Metrics and Milestones
 ----------------------------------
 - MVP: CLI can run sample plan, update YAML, and UI renders the graph with live polling.
 - 30-day goal: Support modifying plan mid-run and rerunning failed nodes through the UI.
 - Quality: Less than 5 percent of plan runs fail due to orchestration errors; schema validator catches 95 percent of authoring mistakes pre-run.
 
-11. Open Questions
+12. Open Questions
 ------------------
 - Should updates be chunked into an append-only log to avoid merge conflicts?
 - Is streaming of long-running node output required for the UI?
