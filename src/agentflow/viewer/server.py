@@ -150,11 +150,19 @@ INDEX_TEMPLATE = """<!doctype html>
       background: rgba(15, 23, 42, 0.8);
       border-radius: 1rem;
       border: 1px solid rgba(148, 163, 184, 0.2);
-      padding: 1rem;
+      padding: 1rem 1rem 0.75rem;
       display: flex;
       flex-direction: column;
-      gap: 1rem;
+      gap: 0.5rem;
       min-height: 420px;
+    }
+    .graph-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: rgba(148, 163, 184, 0.85);
+      font-size: 0.85rem;
+      padding: 0 0.5rem;
     }
     #graph {
       flex: 1;
@@ -201,9 +209,24 @@ INDEX_TEMPLATE = """<!doctype html>
       border: 1px solid rgba(148, 163, 184, 0.2);
       padding: 1.2rem;
     }
+    .node-detail header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+      background: none;
+      border: none;
+      padding: 0;
+      position: static;
+    }
     .node-detail h2 {
-      margin: 0 0 0.75rem;
+      margin: 0;
       font-size: 1.1rem;
+    }
+    .node-detail h3 {
+      margin: 1rem 0 0.5rem;
+      font-size: 0.95rem;
+      color: rgba(226, 232, 240, 0.9);
     }
     .node-detail pre {
       background: rgba(15, 23, 42, 0.75);
@@ -213,6 +236,11 @@ INDEX_TEMPLATE = """<!doctype html>
       overflow-x: auto;
       font-size: 0.85rem;
       line-height: 1.4;
+    }
+    .node-detail p {
+      margin: 0.2rem 0;
+      font-size: 0.88rem;
+      color: rgba(203, 213, 225, 0.9);
     }
     .empty-state {
       flex: 1;
@@ -236,25 +264,32 @@ INDEX_TEMPLATE = """<!doctype html>
     }
     a:hover { text-decoration: underline; }
   </style>
-  <script src="https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js" integrity="sha384-J0LCJeLvvcSp5pB0Aw3+8aVBRm2gIF5fz9wzwMojV2Xxk6v9zzUGULF2hFXhb4RL" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/cytoscape@3.26.0/dist/cytoscape.min.js" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js" crossorigin="anonymous"></script>
   <script>
     const statusToClass = (status) => {
       if (!status) return "status-other";
       const value = String(status).toLowerCase();
       if (value === "completed" || value === "succeeded") return "status-completed";
       if (value === "running" || value === "in_progress") return "status-running";
-      if (value === "failed") return "status-failed";
-      if (value === "pending" || value === "blocked") return "status-pending";
+      if (value === "failed" || value === "error") return "status-failed";
+      if (value === "pending" || value === "blocked" || value === "queued") return "status-pending";
       return "status-other";
     };
 
     document.addEventListener("DOMContentLoaded", () => {
+      if (window.cytoscape && window.cytoscapeDagre) {
+        cytoscape.use(cytoscapeDagre);
+      }
+
       const rootDirectory = document.body.dataset.root || "";
       const sidebar = document.querySelector(".plan-list");
       const searchInput = document.querySelector(".plan-search");
       const planSummary = document.querySelector(".summary-panel");
       const nodeDetail = document.querySelector(".node-detail");
       const graphContainer = document.getElementById("graph");
+      const graphHeader = document.querySelector(".graph-header span");
       const emptyState = document.querySelector(".graph-container .empty-state");
       const planTitle = document.querySelector("[data-plan-title]");
       const planMeta = document.querySelector("[data-plan-meta]");
@@ -377,64 +412,106 @@ INDEX_TEMPLATE = """<!doctype html>
         }
         const statusLabel = escapeHtml(node.status || "unknown");
         const summary = escapeHtml(node.summary || node.id);
-        const nodeId = escapeHtml(node.id);
+        const nodeKey = escapeHtml(node.id);
         const nodeType = escapeHtml(node.type || "unknown");
         const dependsOn = (node.depends_on || []).length
           ? node.depends_on.map((dep) => escapeHtml(dep)).join(", ")
           : "None";
+        const heading = document.createElement("header");
+        heading.innerHTML = `
+          <div class="status-pill ${statusToClass(node.status)}">${statusLabel}</div>
+          <div>
+            <h2>${summary}</h2>
+            <p><strong>Node:</strong> ${nodeKey} | <strong>Type:</strong> ${nodeType} | <strong>Depends on:</strong> ${dependsOn}</p>
+          </div>
+        `;
         const buildBlock = (label, data) => {
           const text = JSON.stringify(data, null, 2);
           return "<h3>" + escapeHtml(label) + "</h3><pre>" + escapeHtml(text) + "</pre>";
         };
 
-        nodeDetail.innerHTML = `
-          <div class="status-pill ${statusToClass(node.status)}">${statusLabel}</div>
-          <h2>${summary}</h2>
-          <p><strong>Node:</strong> ${nodeId} | <strong>Type:</strong> ${nodeType} | <strong>Depends on:</strong> ${dependsOn}</p>
-          ${buildBlock("Inputs", node.inputs || {})}
-          ${buildBlock("Outputs", node.outputs || {})}
-          ${buildBlock("Artifacts", node.artifacts || [])}
-          ${buildBlock("History", node.history || [])}
-        `;
+        nodeDetail.innerHTML = "";
+        nodeDetail.appendChild(heading);
+        nodeDetail.insertAdjacentHTML("beforeend", buildBlock("Inputs", node.inputs || {}));
+        nodeDetail.insertAdjacentHTML("beforeend", buildBlock("Outputs", node.outputs || {}));
+        nodeDetail.insertAdjacentHTML("beforeend", buildBlock("Artifacts", node.artifacts || []));
+        nodeDetail.insertAdjacentHTML("beforeend", buildBlock("History", node.history || []));
       };
 
       const configureGraph = (elements) => {
-        if (!graphContainer) return;
+        if (!graphContainer || !window.cytoscape) return;
         if (cyInstance) {
           cyInstance.destroy();
         }
         cyInstance = cytoscape({
           container: graphContainer,
           elements: elements,
-          zoomingEnabled: true,
           userZoomingEnabled: true,
-          layout: { name: "breadthfirst", directed: true, padding: 25, spacingFactor: 1.6 },
+          autoungrabify: true,
+          boxSelectionEnabled: false,
+          layout: { name: "grid" },
           style: [
             {
               selector: "node",
               style: {
-                "background-color": ele => {
-                  const status = ele.data("status");
-                  const cls = statusToClass(status);
-                  if (cls === "status-completed") return "#22d3ee";
-                  if (cls === "status-running") return "#38bdf8";
-                  if (cls === "status-failed") return "#f87171";
-                  if (cls === "status-pending") return "#fbbf24";
-                  return "#94a3b8";
-                },
+                shape: "roundrectangle",
+                "background-color": "#1e293b",
+                "background-opacity": 0.95,
+                "border-width": 3,
+                "border-color": "#475569",
+                "border-opacity": 0.95,
+                color: "#e2e8f0",
                 label: "data(label)",
                 "font-size": "12px",
-                color: "#0f172a",
                 "font-weight": 600,
                 "text-wrap": "wrap",
-                "text-max-width": "140px",
-                width: 48,
-                height: 48,
-                "border-width": 4,
-                "border-style": "solid",
-                "border-color": "#0f172a",
-                "overlay-opacity": 0.12,
-                "overlay-padding": "6px"
+                "text-max-width": "200px",
+                "text-halign": "center",
+                "text-valign": "center",
+                "line-height": 1.3,
+                width: 220,
+                height: 120,
+                padding: "12px",
+                "shadow-blur": 26,
+                "shadow-color": "rgba(15, 23, 42, 0.8)",
+                "shadow-offset-x": 0,
+                "shadow-offset-y": 10,
+                "overlay-opacity": 0
+              }
+            },
+            {
+              selector: ".status-completed",
+              style: {
+                "border-color": "#22c55e",
+                "background-color": "rgba(34, 197, 94, 0.18)"
+              }
+            },
+            {
+              selector: ".status-running",
+              style: {
+                "border-color": "#38bdf8",
+                "background-color": "rgba(56, 189, 248, 0.18)"
+              }
+            },
+            {
+              selector: ".status-failed",
+              style: {
+                "border-color": "#ef4444",
+                "background-color": "rgba(239, 68, 68, 0.18)"
+              }
+            },
+            {
+              selector: ".status-pending",
+              style: {
+                "border-color": "#f59e0b",
+                "background-color": "rgba(245, 158, 11, 0.18)"
+              }
+            },
+            {
+              selector: ".status-other",
+              style: {
+                "border-color": "#94a3b8",
+                "background-color": "rgba(148, 163, 184, 0.18)"
               }
             },
             {
@@ -442,20 +519,36 @@ INDEX_TEMPLATE = """<!doctype html>
               style: {
                 width: 3,
                 "curve-style": "bezier",
-                "target-arrow-shape": "triangle",
-                "target-arrow-color": "rgba(148, 163, 184, 0.9)",
-                "line-color": "rgba(148, 163, 184, 0.45)"
+                "control-point-step-size": 60,
+                "target-arrow-shape": "vee",
+                "target-arrow-color": "#64748b",
+                "line-color": "#475569",
+                "arrow-scale": 1.3,
+                "opacity": 0.9
               }
             },
             {
               selector: "node:selected",
               style: {
-                "border-color": "#f8fafc",
-                "border-width": 5
+                "border-width": 5,
+                "border-color": "#fafafa"
               }
             }
           ]
         });
+
+        const layout = cyInstance.layout({
+          name: "dagre",
+          fit: true,
+          padding: 50,
+          rankDir: "TB",
+          nodeSep: 80,
+          rankSep: 120,
+          animate: true,
+          animationDuration: 300
+        });
+        layout.run();
+        cyInstance.fit();
 
         cyInstance.on("tap", "node", (evt) => {
           const nodeId = evt.target.id();
@@ -472,6 +565,9 @@ INDEX_TEMPLATE = """<!doctype html>
           activePlan = detail;
           nodeLookup = detail.nodes_index || {};
           renderPlanSummary(detail);
+          if (graphHeader) {
+            graphHeader.textContent = detail.nodes_index ? Object.keys(detail.nodes_index).length + " node(s)" : "0 node(s)";
+          }
           configureGraph(detail.graph_elements || []);
           renderNodeDetail(null);
           renderPlans();
@@ -541,6 +637,10 @@ INDEX_TEMPLATE = """<!doctype html>
       <section class="summary-panel"></section>
 
       <section class="graph-container">
+        <div class="graph-header">
+          <span>0 node(s)</span>
+          <span>Layout: top-to-bottom • Drag to inspect • Scroll to zoom</span>
+        </div>
         <div class="empty-state">
           <p>Choose a plan to visualize its execution DAG.</p>
         </div>
@@ -675,12 +775,11 @@ def _plan_detail_payload(artifact: PlanArtifact) -> Dict[str, Any]:
     status_counts: Dict[str, int] = {}
 
     for node in raw_nodes:
-        node_id = str(node.get("id") or "")
+        node_id = str(node.get("id") or "").strip()
         if not node_id:
             continue
         status = str(node.get("status") or "unknown")
         status_counts[status] = status_counts.get(status, 0) + 1
-        label = node.get("summary") or node_id
         node_payload = {
             "id": node_id,
             "summary": node.get("summary"),
@@ -696,24 +795,34 @@ def _plan_detail_payload(artifact: PlanArtifact) -> Dict[str, Any]:
             "history": node.get("history") or [],
         }
         nodes_index[node_id] = node_payload
+
+    for node_id, node_payload in nodes_index.items():
+        status = node_payload["status"]
+        display_summary = _truncate(node_payload.get("summary") or node_id, limit=120)
+        node_type = node_payload.get("type") or "task"
+        subtitle = f"{node_type} • {status.replace('_', ' ')}"
+        label = f"{node_id}\\n{display_summary}\\n{subtitle}"
         graph_elements.append(
             {
                 "data": {
                     "id": node_id,
                     "label": label,
+                    "title": display_summary,
+                    "subtitle": subtitle,
                     "status": status,
-                    "type": node_payload["type"] or "task",
-                }
+                    "type": node_type,
+                },
+                "classes": _status_css_class(status),
             }
         )
 
     for node in raw_nodes:
-        node_id = str(node.get("id") or "")
+        node_id = str(node.get("id") or "").strip()
         if not node_id:
             continue
         for dependency in node.get("depends_on") or []:
-            dep_id = str(dependency)
-            if dep_id not in nodes_index:
+            dep_id = str(dependency).strip()
+            if not dep_id or dep_id not in nodes_index:
                 continue
             edge_id = f"{dep_id}->{node_id}"
             graph_elements.append(
@@ -739,3 +848,23 @@ def _plan_detail_payload(artifact: PlanArtifact) -> Dict[str, Any]:
         "graph_elements": graph_elements,
         "nodes_index": nodes_index,
     }
+
+
+def _status_css_class(status: str) -> str:
+    normalized = (status or "unknown").lower()
+    if normalized in {"completed", "succeeded"}:
+        return "status-completed"
+    if normalized in {"running", "in_progress"}:
+        return "status-running"
+    if normalized in {"failed", "error"}:
+        return "status-failed"
+    if normalized in {"pending", "blocked", "queued"}:
+        return "status-pending"
+    return "status-other"
+
+
+def _truncate(text: str, *, limit: int) -> str:
+    clean = (text or "").strip()
+    if len(clean) <= limit:
+        return clean
+    return f"{clean[: limit - 1].rstrip()}…"
