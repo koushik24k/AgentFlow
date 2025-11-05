@@ -77,8 +77,14 @@ class CodexCLIAdapter:
             When the CLI exits with a non-zero status or the output cannot be parsed.
         """
 
+        if not (self._settings.openai_api_key or os.environ.get("OPENAI_API_KEY")):
+            raise CodexCLIError(
+                "OPENAI_API_KEY must be set in the environment or Settings for Codex adapter."
+            )
+
         env = os.environ.copy()
-        env["OPENAI_API_KEY"] = self._settings.openai_api_key
+        if self._settings.openai_api_key:
+            env["OPENAI_API_KEY"] = self._settings.openai_api_key
 
         command = self.build_base_command() + ["-"]
 
