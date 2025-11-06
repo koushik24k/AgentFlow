@@ -1,5 +1,4 @@
-"""
-AgentFlow CLI entry point.
+"""AgentFlow CLI entry point.
 
 Supports two workflows:
 1. `agentflow "<prompt>"` — execute the prompt through the Codex CLI adapter and persist a
@@ -16,14 +15,16 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 from textwrap import dedent
 
 import yaml
+from langgraph.graph import END, StateGraph
 
 from agentflow.adapters import (
     CodexCLIAdapter,
     CodexCLIError,
+    CodexResult,
     CopilotCLIAdapter,
     CopilotCLIError,
     MockAdapter,
@@ -31,7 +32,6 @@ from agentflow.adapters import (
 )
 from agentflow.config import ConfigurationError, Settings
 from agentflow.viewer import run_viewer
-
 
 FLOW_SPEC_COMPILER_PROMPT = dedent(
     """\
@@ -53,6 +53,263 @@ FLOW_SPEC_COMPILER_PROMPT = dedent(
     """
 )
 
+class _PromptRunState(TypedDict, total=False):
+    prompt: str
+    summary: str
+    plan_id: str
+    request_afl: bool
+    run_started: datetime
+    run_finished: datetime
+    duration_seconds: float
+    plan_status: str
+    node_status: str
+    outputs: Dict[str, Any]
+    usage: Dict[str, Any]
+    events: List[Dict[str, Any]]
+    notes: str
+    error_payload: Optional[Dict[str, Any]]
+    evaluation_payload: Optional[Dict[str, Any]]
+    flow_spec_payload: Optional[Dict[str, Any]]
+    flow_spec_source: Optional[str]
+    afl_text: Optional[str]
+    synthetic_nodes: List[Dict[str, Any]]
+    codex_result: CodexResult
+    plan_document: Dict[str, Any]
+
+def _timing_update(state: _PromptRunState) -> Dict[str, Any]:
+    run_started = state["run_started"]
+    finished = datetime.now(timezone.utc)
+    duration = (finished - run_started).total_seconds()
+    return {"run_finished": finished, "duration_seconds": duration}
+
+def _build_prompt_pipeline(adapter: CodexCLIAdapter):
+    graph = StateGraph(_PromptRunState)
+
+    def initialize(state: _PromptRunState) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        return {
+            "run_started": now,
+            "run_finished": now,
+            "duration_seconds": 0.0,
+            "plan_status": "pending",
+            "node_status": "pending",
+            "outputs": {},
+            "usage": {},
+            "events": [],
+            "notes": "Codex invocation pending.",
+        }
+
+    def invoke_model(state: _PromptRunState) -> Dict[str, Any]:
+        try:
+            result = adapter.run(state["prompt"])
+        except CodexCLIError as exc:
+            update = {
+                "plan_status": "failed",
+                "node_status": "failed",
+                "error_payload": {"message": str(exc)},
+                "notes": f"Codex invocation failed: {exc}",
+                "outputs": {"events": []},
+                "events": [],
+                "usage": {},
+            }
+            update.update(_timing_update(state))
+            return update
+
+        outputs = {
+            "message": result.message,
+            "events": result.events,
+        }
+        update = {
+            "plan_status": "completed",
+            "node_status": "succeeded",
+            "codex_result": result,
+            "outputs": outputs,
+            "events": result.events,
+            "usage": result.usage or {},
+            "notes": "Codex invocation succeeded.",
+        }
+        update.update(_timing_update(state))
+        return update
+
+    def parse_flow_spec(state: _PromptRunState) -> Dict[str, Any]:
+        if state.get("plan_status") != "completed":
+            return {}
+        result = state.get("codex_result")
+        if not result:
+            return {}
+
+        flow_spec_payload = _extract_flow_spec_from_message(result.message)
+        outputs = dict(state.get("outputs") or {})
+        update: Dict[str, Any] = {}
+        if flow_spec_payload:
+            outputs["flow_spec"] = flow_spec_payload["flow_spec"]
+            outputs["flow_spec_raw"] = flow_spec_payload["raw_json"]
+            outputs["flow_spec_source"] = "assistant"
+            afl_candidate = flow_spec_payload.get("agentflowlanguage")
+            if afl_candidate:
+                outputs["agentflowlanguage"] = afl_candidate
+                update["afl_text"] = afl_candidate
+            update["flow_spec_payload"] = flow_spec_payload
+            update["flow_spec_source"] = "assistant"
+
+        update["outputs"] = outputs
+        return update
+
+    def maybe_compile(state: _PromptRunState) -> Dict[str, Any]:
+        if state.get("plan_status") != "completed":
+            return {}
+
+        flow_spec_payload = state.get("flow_spec_payload")
+        request_afl = state.get("request_afl", False)
+        afl_text = state.get("afl_text")
+        need_compile = flow_spec_payload is None or (request_afl and not afl_text)
+        if not need_compile:
+            return {}
+
+        compiler_details = _compile_flow_spec_from_prompt(adapter, state["prompt"])
+        outputs = dict(state.get("outputs") or {})
+        outputs["flow_spec_compiler"] = {
+            "message": compiler_details.get("message", ""),
+            "usage": compiler_details.get("usage", {}),
+            "events": compiler_details.get("events", []),
+            "source": compiler_details.get("source", "agentflowlanguage_compiler"),
+        }
+        error = compiler_details.get("error")
+        if error:
+            outputs["flow_spec_compiler_error"] = error
+
+        update: Dict[str, Any] = {"outputs": outputs}
+        compiled_payload = compiler_details.get("flow_spec_payload")
+        if compiled_payload:
+            outputs["flow_spec"] = compiled_payload["flow_spec"]
+            outputs["flow_spec_raw"] = compiled_payload["raw_json"]
+            source = compiler_details.get("source") or "agentflowlanguage_compiler"
+            outputs["flow_spec_source"] = source
+            update["flow_spec_payload"] = compiled_payload
+            update["flow_spec_source"] = source
+            afl_candidate = compiled_payload.get("agentflowlanguage")
+            if afl_candidate:
+                outputs["agentflowlanguage"] = afl_candidate
+                update["afl_text"] = afl_candidate
+
+        afl_from_compiler = compiler_details.get("agentflowlanguage")
+        if afl_from_compiler:
+            outputs["agentflowlanguage"] = afl_from_compiler
+            update["afl_text"] = afl_from_compiler
+
+        update.update(_timing_update(state))
+        return update
+
+    def self_evaluate(state: _PromptRunState) -> Dict[str, Any]:
+        if state.get("plan_status") != "completed":
+            return {}
+
+        result = state.get("codex_result")
+        if not result:
+            return {}
+
+        evaluation_payload = _perform_self_evaluation(adapter, state["prompt"], result.message)
+        if not evaluation_payload:
+            return {}
+
+        outputs = dict(state.get("outputs") or {})
+        outputs["evaluation"] = _build_evaluation_outputs(evaluation_payload)
+
+        update: Dict[str, Any] = {
+            "evaluation_payload": evaluation_payload,
+            "outputs": outputs,
+        }
+        update.update(_timing_update(state))
+        return update
+
+    def synthesize_nodes(state: _PromptRunState) -> Dict[str, Any]:
+        if state.get("plan_status") != "completed":
+            return {}
+
+        flow_spec_payload = state.get("flow_spec_payload")
+        if not flow_spec_payload:
+            return {}
+
+        synthetic_nodes = _build_flow_nodes(
+            flow_spec_payload["flow_spec"],
+            run_started=state["run_started"],
+            run_finished=state.get("run_finished", state["run_started"]),
+        )
+        outputs = dict(state.get("outputs") or {})
+        if synthetic_nodes:
+            outputs.setdefault("flow_spec", flow_spec_payload["flow_spec"])
+            if state.get("flow_spec_source"):
+                outputs["flow_spec_source"] = state["flow_spec_source"]
+
+        return {"synthetic_nodes": synthetic_nodes, "outputs": outputs}
+
+    def build_plan(state: _PromptRunState) -> Dict[str, Any]:
+        outputs = dict(state.get("outputs") or {})
+        outputs.setdefault("events", state.get("events", []))
+        flow_spec_source = state.get("flow_spec_source")
+        if flow_spec_source and outputs.get("flow_spec"):
+            outputs["flow_spec_source"] = flow_spec_source
+
+        run_started = state["run_started"]
+        previous_finished = state.get("run_finished", run_started)
+        now = datetime.now(timezone.utc)
+        if now > previous_finished:
+            run_finished = now
+            duration_seconds = (run_finished - run_started).total_seconds()
+        else:
+            run_finished = previous_finished
+            duration_seconds = state.get("duration_seconds", (run_finished - run_started).total_seconds())
+
+        plan_document = _build_plan_document(
+            plan_id=state["plan_id"],
+            prompt=state["prompt"],
+            summary=state["summary"],
+            plan_status=state.get("plan_status", "failed"),
+            node_status=state.get("node_status", "failed"),
+            outputs=outputs,
+            usage=state.get("usage", {}),
+            events=state.get("events", []),
+            error_payload=state.get("error_payload"),
+            run_started=run_started,
+            run_finished=run_finished,
+            duration_seconds=duration_seconds,
+            notes=state.get("notes", ""),
+            evaluation_payload=state.get("evaluation_payload"),
+            synthetic_nodes=state.get("synthetic_nodes"),
+        )
+
+        return {
+            "plan_document": plan_document,
+            "outputs": outputs,
+            "run_finished": run_finished,
+            "duration_seconds": duration_seconds,
+        }
+
+    def post_invoke_route(state: _PromptRunState) -> str:
+        return "failure" if state.get("plan_status") == "failed" else "success"
+
+    graph.add_node("initialize", initialize)
+    graph.add_node("invoke_model", invoke_model)
+    graph.add_node("parse_flow_spec", parse_flow_spec)
+    graph.add_node("maybe_compile", maybe_compile)
+    graph.add_node("self_evaluate", self_evaluate)
+    graph.add_node("synthesize_nodes", synthesize_nodes)
+    graph.add_node("build_plan", build_plan)
+
+    graph.set_entry_point("initialize")
+    graph.add_edge("initialize", "invoke_model")
+    graph.add_conditional_edges(
+        "invoke_model",
+        post_invoke_route,
+        {"failure": "build_plan", "success": "parse_flow_spec"},
+    )
+    graph.add_edge("parse_flow_spec", "maybe_compile")
+    graph.add_edge("maybe_compile", "self_evaluate")
+    graph.add_edge("self_evaluate", "synthesize_nodes")
+    graph.add_edge("synthesize_nodes", "build_plan")
+    graph.add_edge("build_plan", END)
+
+    return graph.compile()
 
 def main(argv: Optional[List[str]] = None) -> int:
     """
@@ -95,14 +352,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     return _handle_prompt(prompt, output_mode=namespace.output)
 
-
 def _print_usage() -> None:
     print(
         "Usage:\n"
         '  agentflow "<prompt text>"        Execute prompt via Codex and capture YAML artifact.\n'
         "  agentflow view [options]         Launch local viewer for AgentFlow artifacts.\n"
     )
-
 
 def _handle_view_command(args: List[str]) -> int:
     parser = argparse.ArgumentParser(
@@ -140,7 +395,6 @@ def _handle_view_command(args: List[str]) -> int:
         return 0
     return 0
 
-
 def _handle_prompt(prompt: str, *, output_mode: str) -> int:
     try:
         settings = Settings.from_env()
@@ -169,119 +423,105 @@ def _handle_prompt(prompt: str, *, output_mode: str) -> int:
         print(f"Unknown adapter '{adapter_name}'. Use 'codex', 'copilot', or 'mock'.", file=sys.stderr)
         return 1
 
-    node_status = "succeeded"
-    plan_status = "completed"
-    outputs: Dict[str, Any] = {}
-    usage: Dict[str, Any] = {}
-    events: List[Dict[str, Any]] = []
-    error_payload: Optional[Dict[str, Any]] = None
-    notes = "Codex invocation succeeded."
-    evaluation_payload: Optional[Dict[str, Any]] = None
-    flow_spec_payload: Optional[Dict[str, Any]] = None
-    flow_spec_source: Optional[str] = None
-    afl_text: Optional[str] = None
+    summary = prompt[:80].replace("\n", " ").strip() or "Ad-hoc Codex execution"
     request_afl = output_mode == "afl"
 
-    run_started = datetime.now(timezone.utc)
+    pipeline = _build_prompt_pipeline(adapter)
+    initial_state: _PromptRunState = {
+        "prompt": prompt,
+        "summary": summary,
+        "plan_id": plan_id,
+        "request_afl": request_afl,
+    }
+
     try:
-        result = adapter.run(prompt)
-        events = result.events
-        outputs = {"message": result.message, "events": events}
-        usage = result.usage or {}
-        flow_spec_payload = _extract_flow_spec_from_message(result.message)
-        if flow_spec_payload:
-            flow_spec_source = "assistant"
-            outputs["flow_spec"] = flow_spec_payload["flow_spec"]
-            outputs["flow_spec_raw"] = flow_spec_payload["raw_json"]
-            afl_candidate = flow_spec_payload.get("agentflowlanguage")
-            if afl_candidate:
-                afl_text = afl_candidate
-                outputs["agentflowlanguage"] = afl_text
-        evaluation_payload = _perform_self_evaluation(adapter, prompt, result.message)
-        if evaluation_payload:
-            outputs["evaluation"] = _build_evaluation_outputs(evaluation_payload)
+        final_state = pipeline.invoke(initial_state)
     except (CodexCLIError, CopilotCLIError, MockAdapterError) as exc:
         node_status = "failed"
         plan_status = "failed"
         error_payload = {"message": str(exc)}
         notes = f"Adapter invocation failed: {exc}"
+        run_finished = datetime.now(timezone.utc)
+        duration = (run_finished - timestamp).total_seconds()
+        final_state = {
+            "plan_status": "failed",
+            "node_status": "failed",
+            "error_payload": error_payload,
+            "notes": notes,
+            "run_started": timestamp,
+            "run_finished": run_finished,
+            "duration_seconds": duration,
+            "outputs": {"events": []},
+            "usage": {},
+            "events": [],
+        }
     except Exception as exc:  # pragma: no cover - defensive catch
-        node_status = "failed"
-        plan_status = "failed"
-        error_payload = {"message": f"Unexpected error: {exc.__class__.__name__}: {exc}"}
-        notes = f"Unexpected error: {exc.__class__.__name__}"
-    run_finished = datetime.now(timezone.utc)
+        run_finished = datetime.now(timezone.utc)
+        duration = (run_finished - timestamp).total_seconds()
+        error_payload = {"message": f"Unexpected pipeline error: {exc.__class__.__name__}: {exc}"}
+        plan_document = _build_plan_document(
+            plan_id=plan_id,
+            prompt=prompt,
+            summary=summary,
+            plan_status="failed",
+            node_status="failed",
+            outputs={"events": []},
+            usage={},
+            events=[],
+            error_payload=error_payload,
+            run_started=timestamp,
+            run_finished=run_finished,
+            duration_seconds=duration,
+            notes=f"Pipeline error: {exc.__class__.__name__}",
+            evaluation_payload=None,
+            synthetic_nodes=None,
+        )
+        _write_plan(target_path, plan_document)
+        print(f"Wrote plan artifact: {target_path}")
+        print("Execution failed; inspect the YAML artifact for details.", file=sys.stderr)
+        return 1
 
-    if plan_status == "completed" and (flow_spec_payload is None or (request_afl and not afl_text)):
-        compiler_details = _compile_flow_spec_from_prompt(adapter, prompt)
-        if compiler_details:
-            compiler_error = compiler_details.get("error")
-            if compiler_error:
-                outputs["flow_spec_compiler_error"] = compiler_error
-            else:
-                compiled_payload = compiler_details.get("flow_spec_payload")
-                if compiled_payload:
-                    flow_spec_payload = compiled_payload
-                    flow_spec_source = compiler_details.get("source") or "agentflowlanguage_compiler"
-                    outputs["flow_spec"] = flow_spec_payload["flow_spec"]
-                    outputs["flow_spec_raw"] = flow_spec_payload["raw_json"]
-                    afl_candidate = flow_spec_payload.get("agentflowlanguage")
-                    if afl_candidate:
-                        afl_text = afl_candidate
-                afl_from_compiler = compiler_details.get("agentflowlanguage")
-                if afl_from_compiler:
-                    afl_text = afl_from_compiler
-                outputs["flow_spec_compiler"] = {
-                    "message": compiler_details.get("message", ""),
-                    "usage": compiler_details.get("usage", {}),
-                    "events": compiler_details.get("events", []),
-                    "source": compiler_details.get("source", "agentflowlanguage_compiler"),
-                }
-                if afl_text:
-                    outputs["agentflowlanguage"] = afl_text
+    if not isinstance(final_state, dict):
+        final_state = {}
 
-    if "events" not in outputs:
-        outputs = {**outputs, "events": events}
-
-    if flow_spec_payload:
-        outputs["flow_spec_source"] = flow_spec_source or outputs.get("flow_spec_source") or "assistant"
-        if afl_text:
-            outputs["agentflowlanguage"] = afl_text
-
-    duration = (run_finished - run_started).total_seconds()
-    synthetic_nodes: List[Dict[str, Any]] = []
-    if plan_status == "completed" and flow_spec_payload:
-        synthetic_nodes = _build_flow_nodes(
-            flow_spec_payload["flow_spec"],
+    plan_document = final_state.get("plan_document")
+    if not plan_document:
+        outputs = dict(final_state.get("outputs") or {})
+        usage = dict(final_state.get("usage") or {})
+        events = list(final_state.get("events") or [])
+        error_payload = final_state.get("error_payload")
+        run_started = final_state.get("run_started", timestamp)
+        run_finished = final_state.get("run_finished", run_started)
+        duration = final_state.get(
+            "duration_seconds", (run_finished - run_started).total_seconds()
+        )
+        plan_document = _build_plan_document(
+            plan_id=plan_id,
+            prompt=prompt,
+            summary=summary,
+            plan_status=final_state.get("plan_status", "failed"),
+            node_status=final_state.get("node_status", "failed"),
+            outputs=outputs or {"events": events},
+            usage=usage,
+            events=events,
+            error_payload=error_payload,
             run_started=run_started,
             run_finished=run_finished,
+            duration_seconds=duration,
+            notes=final_state.get("notes", "Pipeline produced no plan document."),
+            evaluation_payload=final_state.get("evaluation_payload"),
+            synthetic_nodes=final_state.get("synthetic_nodes"),
         )
-        if synthetic_nodes:
-            outputs.setdefault("flow_spec", flow_spec_payload["flow_spec"])
-
-    summary = prompt[:80].replace("\n", " ").strip() or "Ad-hoc Codex execution"
-
-    plan_document = _build_plan_document(
-        plan_id=plan_id,
-        prompt=prompt,
-        summary=summary,
-        plan_status=plan_status,
-        node_status=node_status,
-        outputs=outputs,
-        usage=usage,
-        events=events,
-        error_payload=error_payload,
-        run_started=run_started,
-        run_finished=run_finished,
-        duration_seconds=duration,
-        notes=notes,
-        evaluation_payload=evaluation_payload,
-        synthetic_nodes=synthetic_nodes,
-    )
 
     _write_plan(target_path, plan_document)
 
     print(f"Wrote plan artifact: {target_path}")
+    afl_text = final_state.get("afl_text")
+    if not afl_text:
+        outputs_for_afl = final_state.get("outputs") or {}
+        if isinstance(outputs_for_afl, dict):
+            afl_text = outputs_for_afl.get("agentflowlanguage")
+
     if output_mode == "afl":
         if afl_text:
             afl_path = target_path.with_suffix(".afl")
@@ -292,11 +532,12 @@ def _handle_prompt(prompt: str, *, output_mode: str) -> int:
                 "AgentFlowLanguage output requested but no representation was generated.",
                 file=sys.stderr,
             )
+
+    plan_status = plan_document.get("status") or final_state.get("plan_status", "failed")
     if plan_status == "failed":
         print("Execution failed; inspect the YAML artifact for details.", file=sys.stderr)
         return 1
     return 0
-
 
 def _resolve_plan_path(base_name: str) -> Tuple[Path, str]:
     directory = Path.cwd()
@@ -309,7 +550,6 @@ def _resolve_plan_path(base_name: str) -> Tuple[Path, str]:
     filename = candidate.stem
     plan_id = f"plan-{filename.split('-', 1)[-1]}"
     return candidate, plan_id
-
 
 def _build_plan_document(
     *,
@@ -410,16 +650,13 @@ def _build_plan_document(
 
     return plan_document
 
-
 def _write_plan(path: Path, payload: Dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(payload, handle, sort_keys=False)
 
-
 def _write_afl(path: Path, afl_text: str) -> None:
     with path.open("w", encoding="utf-8") as handle:
         handle.write(afl_text.rstrip() + "\n")
-
 
 def _perform_self_evaluation(
     adapter: CodexCLIAdapter,
@@ -458,7 +695,6 @@ def _perform_self_evaluation(
         payload["error"] = "Self-evaluation response was not valid JSON."
     return payload
 
-
 def _parse_evaluation_payload(message: str) -> Optional[Dict[str, Any]]:
     candidate = message.strip()
     if candidate.startswith("```"):
@@ -484,7 +720,6 @@ def _parse_evaluation_payload(message: str) -> Optional[Dict[str, Any]]:
 
     return {"score": score, "justification": justification}
 
-
 def _build_metrics(usage: Dict[str, Any], evaluation_payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     metrics: Dict[str, Any] = {"usage": usage}
     if evaluation_payload:
@@ -499,7 +734,6 @@ def _build_metrics(usage: Dict[str, Any], evaluation_payload: Optional[Dict[str,
             metrics["evaluation_error"] = error
     return metrics
 
-
 def _build_evaluation_outputs(evaluation_payload: Dict[str, Any]) -> Dict[str, Any]:
     outputs: Dict[str, Any] = {}
     if evaluation_payload.get("score") is not None:
@@ -512,7 +746,6 @@ def _build_evaluation_outputs(evaluation_payload: Dict[str, Any]) -> Dict[str, A
     outputs["events"] = evaluation_payload.get("events", [])
     outputs["usage"] = evaluation_payload.get("usage", {})
     return outputs
-
 
 def _parse_plaintext_evaluation(message: str) -> Optional[Dict[str, Any]]:
     score: Optional[float] = None
@@ -565,7 +798,6 @@ def _parse_plaintext_evaluation(message: str) -> Optional[Dict[str, Any]]:
     justification = " ".join(justification_parts).strip() or None
     return {"score": score, "justification": justification}
 
-
 def _extract_flow_spec_from_message(message: str) -> Optional[Dict[str, Any]]:
     if not message:
         return None
@@ -604,7 +836,6 @@ def _extract_flow_spec_from_message(message: str) -> Optional[Dict[str, Any]]:
         payload["agentflowlanguage"] = afl_text
     return payload
 
-
 def _compile_flow_spec_from_prompt(
     adapter: CodexCLIAdapter,
     pseudo_code: str,
@@ -639,7 +870,6 @@ def _compile_flow_spec_from_prompt(
         response["error"] = "Compiler response did not contain a valid flow_spec."
 
     return response
-
 
 def _build_flow_nodes(
     flow_spec: Dict[str, Any],
@@ -723,7 +953,6 @@ def _build_flow_nodes(
         )
 
     return synthetic_nodes
-
 
 if __name__ == "__main__":  # pragma: no cover - module entry point
     raise SystemExit(main())
