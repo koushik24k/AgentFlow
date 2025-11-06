@@ -78,6 +78,23 @@ py -3 -m agentflow.cli --output afl "while(exploring){ ask_questions(); investig
 
 The command above writes the standard `sandbox/agentflow-<timestamp>.yaml` artifact plus `sandbox/agentflow-<timestamp>.afl`, which captures the flow in AgentFlowLanguage form.
 
+## Adaptive Workflow Runs
+
+AgentFlow can now self-improve across multiple cycles. The `workflow` subcommand loops through repeated LangGraph executions, reads the prior cycle’s evaluation, and amends the next prompt with targeted directives before invoking the model again.
+
+```bash
+py -3 -m agentflow.cli workflow --cycles 3 --output afl "Design a LangGraph that triages support tickets by urgency and required department."
+```
+
+Each cycle writes a standard plan artifact (and optional `.afl` file) plus a shared history trail at `sandbox/workflows/<workflow_id>/history.yaml`. The history log records:
+
+- the prompt that was actually issued for each cycle,
+- the self-evaluation score and justification gathered from the previous run,
+- structural statistics about the emitted `flow_spec` (node counts, branching, loops),
+- and the adaptive directives injected into the next prompt.
+
+Every per-cycle plan also receives a `workflow_reflection_cycle_<n>` node so the viewer surfaces what changed between iterations, making it obvious how the LangGraph reasoning evolves.
+
 ## LangGraph Orchestration
 
 AgentFlow now delegates prompt execution and evaluation to a LangGraph state machine. The CLI builds a LangGraph pipeline that:
