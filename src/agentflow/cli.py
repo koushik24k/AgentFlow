@@ -21,7 +21,7 @@ from textwrap import dedent
 
 import yaml
 
-from agentflow.adapters import CodexCLIAdapter, CodexCLIError
+from agentflow.adapters import ADAPTERS, CodexCLIAdapter, CodexCLIError
 from agentflow.config import ConfigurationError, Settings
 from agentflow.viewer import run_viewer
 
@@ -65,7 +65,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agentflow",
         add_help=True,
-        description="Execute a prompt through the Codex adapter and persist an AgentFlow artifact.",
+        description="Execute a prompt through a chosen adapter (codex or claude) and persist an AgentFlow artifact.",
     )
     parser.add_argument(
         "--output",
@@ -74,9 +74,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Artifact output preference (default: yaml). Use 'afl' to also emit an AgentFlowLanguage file.",
     )
     parser.add_argument(
+        "--adapter",
+        choices=sorted(ADAPTERS.keys()),
+        default="codex",
+        help="Which CLI adapter to use (default: codex).",
+    )
+    parser.add_argument(
         "prompt",
         nargs=argparse.REMAINDER,
-        help="Prompt text to send to the Codex adapter.",
+        help="Prompt text to send to the adapter.",
     )
 
     namespace = parser.parse_args(args)
@@ -86,7 +92,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         _print_usage()
         return 1
 
-    return _handle_prompt(prompt, output_mode=namespace.output)
+    return _handle_prompt(prompt, output_mode=namespace.output, adapter_name=namespace.adapter)
 
 
 def _print_usage() -> None:
@@ -134,7 +140,7 @@ def _handle_view_command(args: List[str]) -> int:
     return 0
 
 
-def _handle_prompt(prompt: str, *, output_mode: str) -> int:
+def _handle_prompt(prompt: str, *, output_mode: str, adapter_name: str) -> int:
     try:
         settings = Settings.from_env()
     except ConfigurationError as exc:
@@ -145,7 +151,9 @@ def _handle_prompt(prompt: str, *, output_mode: str) -> int:
     base_name = timestamp.strftime("agentflow-%Y%m%d%H%M%S")
     target_path, plan_id = _resolve_plan_path(base_name)
 
-    adapter = CodexCLIAdapter(settings)
+    # Instantiate selected adapter
+    adapter_cls = ADAPTERS.get(adapter_name, CodexCLIAdapter)
+    adapter = adapter_cls(settings)
 
     node_status = "succeeded"
     plan_status = "completed"
@@ -237,7 +245,10 @@ def _handle_prompt(prompt: str, *, output_mode: str) -> int:
         if synthetic_nodes:
             outputs.setdefault("flow_spec", flow_spec_payload["flow_spec"])
 
-    summary = prompt[:80].replace("\n", " ").strip() or "Ad-hoc Codex execution"
+    summary = (
+        prompt[:80].replace("\n", " ").strip()
+        or ("Ad-hoc Claude execution" if adapter_name == "claude" else "Ad-hoc Codex execution")
+    )
 
     plan_document = _build_plan_document(
         plan_id=plan_id,
